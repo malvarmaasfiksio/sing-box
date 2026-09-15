@@ -76,6 +76,8 @@ jobs:
       - name: Calculate version
         if: github.event_name != 'workflow_dispatch'
         run: |-
+          git fetch https://github.com/SagerNet/sing-box.git --tags
+          git describe --tags
           go run -v ./cmd/internal/read_tag --ci --nightly
       - name: Set outputs
         id: outputs
