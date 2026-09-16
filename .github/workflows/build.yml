@@ -46,6 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.outputs.outputs.version }}
+      has_apple_secrets: ${{ steps.outputs.outputs.has_apple_secrets }}
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
@@ -76,18 +77,24 @@ jobs:
       - name: Calculate version
         if: github.event_name != 'workflow_dispatch'
         run: |-
+          git fetch https://github.com/SagerNet/sing-box.git --tags
+          git describe --tags
           go run -v ./cmd/internal/read_tag --ci --nightly
       - name: Set outputs
         id: outputs
         run: |-
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "has_apple_secrets=${{ secrets.ASC_KEY != '' }}" >> "$GITHUB_OUTPUT"
   build:
     name: Build binary
     if: github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Binary'
     runs-on: ubuntu-26.04
     needs:
       - calculate_version
+    env:
+      HAS_GPG: ${{ secrets.GPG_KEY != '' }}
     strategy:
+      fail-fast: false
       max-parallel: 13
       matrix:
         include:
@@ -365,6 +372,10 @@ jobs:
             -p "dist/sing-box_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.debian }}.deb" \
             --architecture ${{ matrix.debian }} \
             dist/sing-box=/usr/bin/sing-box
+          if [[ "$HAS_GPG" != "true" ]]; then
+            echo "GPG_KEY secret not set, skipping DEB signing"
+            exit 0
+          fi
           rm -rf $HOME/.gnupg
           gpg --pinentry-mode loopback --passphrase "${{ secrets.GPG_PASSPHRASE }}" --import <<EOF
           ${{ secrets.GPG_KEY }}
@@ -382,6 +393,10 @@ jobs:
             -p "dist/sing-box_${{ needs.calculate_version.outputs.version }}_${{ matrix.os }}_${{ matrix.rpm }}.rpm" \
             --architecture ${{ matrix.rpm }} \
             dist/sing-box=/usr/bin/sing-box
+          if [[ "$HAS_GPG" != "true" ]]; then
+            echo "GPG_KEY secret not set, skipping RPM signing"
+            exit 0
+          fi
           cat > $HOME/.rpmmacros <<EOF
           %_gpg_name ${{ secrets.GPG_KEY_ID }}
           %_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase ${{ secrets.GPG_PASSPHRASE }}
@@ -818,6 +833,28 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         run: |-
           go run -v ./cmd/internal/update_android_version --ci --nightly
+      - name: Install release keystore
+        run: |-
+          set -euo pipefail
+          KEYSTORE_PATH=clients/android/app/release.keystore
+          if [[ -n "$ANDROID_KEYSTORE" ]]; then
+            printf '%s' "$ANDROID_KEYSTORE" | base64 -d > "$KEYSTORE_PATH"
+          else
+            echo "::warning::ANDROID_KEYSTORE secret not set, signing with a throwaway keystore (APK cannot be upgraded in place across builds)"
+            rm -f "$KEYSTORE_PATH"
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_PATH" \
+              -storetype PKCS12 \
+              -alias sing-box-ci \
+              -keyalg RSA -keysize 2048 -validity 3650 \
+              -storepass sing-box-ci -keypass sing-box-ci \
+              -dname "CN=sing-box CI, O=sing-box"
+            printf 'KEYSTORE_PASS=sing-box-ci\nALIAS_NAME=sing-box-ci\nALIAS_PASS=sing-box-ci\n' \
+              | base64 -w0 \
+              | sed 's/^/LOCAL_PROPERTIES=/' >> "$GITHUB_ENV"
+          fi
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
       - name: Build
         run: |-
           mkdir -p clients/android/app/libs
@@ -826,7 +863,7 @@ jobs:
           ./gradlew --build-cache --parallel ${{ matrix.task }}
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES }}
+          LOCAL_PROPERTIES: ${{ secrets.LOCAL_PROPERTIES || env.LOCAL_PROPERTIES }}
       - name: Prepare upload
         run: |-
           mkdir -p dist
@@ -1026,11 +1063,24 @@ jobs:
       - name: Setup signing
         run: |-
           $certificatePath = Join-Path $env:RUNNER_TEMP "windows-signing.p12"
-          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATES_P12))
+          $certificatePassword = $env:WINDOWS_P12_PASSWORD
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATES_P12)) {
+            Write-Host "WINDOWS_CERTIFICATES_P12 secret not set, using a self-signed certificate"
+            $certificate = New-SelfSignedCertificate `
+              -Type CodeSigningCert `
+              -Subject "CN=sing-box CI self-signed" `
+              -CertStoreLocation Cert:\CurrentUser\My `
+              -NotAfter (Get-Date).AddYears(1)
+            $certificatePassword = "sing-box-ci"
+            $securePassword = ConvertTo-SecureString $certificatePassword -AsPlainText -Force
+            Export-PfxCertificate -Cert $certificate -FilePath $certificatePath -Password $securePassword | Out-Null
+          } else {
+            [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATES_P12))
+          }
           @{
             windows = @{
               certificateFile = $certificatePath
-              certificatePassword = $env:WINDOWS_P12_PASSWORD
+              certificatePassword = $certificatePassword
             }
           } | ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8NoBOM clients/desktop/signing.local.json
         env:
@@ -1063,7 +1113,10 @@ jobs:
     runs-on: ubuntu-26.04
     needs:
       - calculate_version
+    env:
+      HAS_GPG: ${{ secrets.GPG_KEY != '' }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { desktop_arch: x64, go_arch: amd64 }
@@ -1161,6 +1214,7 @@ jobs:
           GOARM: ${{ matrix.go_arm }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Setup package signing
+        if: env.HAS_GPG == 'true'
         run: |-
           set -euo pipefail
           SIGNING_GNUPG_HOME="$RUNNER_TEMP/package-signing-gnupg"
@@ -1187,6 +1241,7 @@ jobs:
           GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
       - name: Sign Linux packages
+        if: env.HAS_GPG == 'true'
         run: |-
           set -euo pipefail
           debsigs \
@@ -1295,7 +1350,7 @@ jobs:
       matrix:
         include:
           - name: macOS-standalone
-            if: ${{ github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Apple-release' || inputs.build == 'macOS-standalone' }}
+            if: ${{ needs.calculate_version.outputs.has_apple_secrets == 'true' && (github.event_name != 'workflow_dispatch' || inputs.build == 'All' || inputs.build == 'Apple-release' || inputs.build == 'macOS-standalone') }}
             type: standalone
             platform: macos
             variant: all
@@ -1559,7 +1614,7 @@ jobs:
             --api-key $ASC_KEY_ID \
             --api-issuer 00000000-0000-0000-0000-000000000000
       - name: Publish to TestFlight
-        if: matrix.if && matrix.type == 'app-store' && github.event_name == 'workflow_dispatch'
+        if: matrix.if && matrix.type == 'app-store' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/testing'
         run: |-
           arguments=(publish_testflight "${{ matrix.platform }}")
           if [[ -n "$TEST_MESSAGE" ]]; then
@@ -1617,7 +1672,7 @@ jobs:
   build_apple_app_store:
     name: Build Apple App Store clients
     runs-on: ${{ matrix.if && 'macos-26' || 'ubuntu-latest' }}
-    if: github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Apple' || inputs.build == 'iOS' || inputs.build == 'macOS' || inputs.build == 'tvOS')
+    if: needs.calculate_version.outputs.has_apple_secrets == 'true' && github.event_name == 'workflow_dispatch' && (inputs.build == 'All' || inputs.build == 'Apple' || inputs.build == 'iOS' || inputs.build == 'macOS' || inputs.build == 'tvOS')
     needs:
       - calculate_version
       - build_apple_library
